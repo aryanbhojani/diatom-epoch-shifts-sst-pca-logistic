@@ -1,0 +1,592 @@
+---
+title: "Diatom Community Shifts Across a Late-Pleistocene to Holocene Climate Transition"
+author: "Aryan Bhojani"
+format:
+  pdf:
+    toc: true
+    number-sections: true
+  html:
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+  cache: false
+---
+
+## Project overview
+
+This project explores how diatom community composition changes through time in a Gulf of California sediment core, and how those changes relate to a major climate transition spanning the end of the Pleistocene and the start of the Holocene. I treat each depth sample as a time-indexed snapshot of phytoplankton community structure.
+
+Main goals:
+1. Clean and standardize diatom count data into comparable relative abundances.
+2. Visualize how taxa vary through time and across climate epochs.
+3. Relate diatom abundance patterns to reconstructed sea surface temperature (SST).
+4. Summarize multivariate community structure using PCA and compare it to a supervised separation direction from logistic regression.
+
+## Setup
+
+```{r}
+rm(list = ls())
+
+library(tidyverse)
+library(patchwork)
+library(ggridges)
+library(corrplot)
+library(colorspace)
+
+library(hexbin)
+library(RColorBrewer)
+
+set.seed(1)
+```
+
+## Data description
+
+Diatom counts were recorded at evenly spaced depths in a sediment core. Depth corresponds to time before present (older at greater depth). The dataset contains:
+
+* Depth (cm)
+* Age (thousands of years before present, KyrBP)
+* Multiple diatom taxa counts
+* Num.counted: total phytoplankton counted in that sample (not only diatoms)
+
+I convert counts to relative abundances by dividing each taxon count by Num.counted, so values are comparable across samples.
+
+## Load data
+
+```{r}
+diatoms_raw <- read_csv("data/barron-diatoms.csv")
+glimpse(diatoms_raw)
+```
+
+## Data quality: missing values
+
+In this dataset, missing values represent taxa that were not observed in a sample (recorded as NA). I quantify missingness by taxon, then replace NA with 0.
+
+```{r}
+missing_frac <- diatoms_raw |>
+summarize(
+across(
+A_curv:StephanSpp,
+~ mean(is.na(.x)),
+.names = "{.col}_missing_frac"
+)
+)
+
+missing_frac
+```
+
+### Replace NA with 0 for taxa counts
+
+```{r}
+diatoms1 <- diatoms_raw |>
+mutate(across(A_curv:StephanSpp, ~ replace_na(.x, 0)))
+
+diatoms_mod1_examplerows <- diatoms1 |>
+slice(94, 95)
+
+diatoms_mod1_examplerows
+```
+
+## Transform counts to relative abundances
+
+Two steps:
+
+1. Convert diatom counts to proportions by dividing by Num.counted.
+2. Flip Age to negative so that "older" is more negative (useful for plotting timelines left-to-right toward the present).
+
+```{r}
+diatoms2 <- diatoms1 |>
+mutate(
+Age = -1 * Age,
+across(A_curv:StephanSpp, ~ .x / Num.counted)
+)
+
+diatoms2 |> head()
+```
+
+## Time coverage and sampling resolution
+
+### Time span (in years)
+
+```{r}
+oldest_years_bp <- max(diatoms_raw$Age, na.rm = TRUE) * 1000
+newest_years_bp <- min(diatoms_raw$Age, na.rm = TRUE) * 1000
+
+tibble(
+newest_years_bp = newest_years_bp,
+oldest_years_bp = oldest_years_bp,
+span_years = oldest_years_bp - newest_years_bp
+)
+```
+
+### Sampling gaps
+
+I compute time steps between consecutive samples and visualize the gap distribution.
+
+```{r}
+diatoms3 <- diatoms2 |>
+arrange(Age) |>
+mutate(Gap = c(NA, diff(Age)))
+
+gap_histogram <- diatoms3 |>
+ggplot(aes(x = Gap)) +
+geom_histogram(binwidth = 0.02) +
+labs(
+x = "Time step between consecutive samples (kyr)",
+y = "Number of intervals",
+title = "Sampling resolution through time"
+) +
+theme_bw()
+
+gap_histogram
+```
+
+## Univariate summaries: which taxa dominate?
+
+I summarize mean and standard deviation of each taxon’s relative abundance.
+
+```{r}
+diatom_summary <- diatoms3 |>
+summarize(
+across(
+A_curv:StephanSpp,
+list(
+mean = ~ mean(.x, na.rm = TRUE),
+sd   = ~ sd(.x,   na.rm = TRUE)
+),
+.names = "{.col}_{.fn}"
+)
+)
+
+diatom_summary
+```
+
+### Tidy comparison table (mean vs sd)
+
+```{r}
+diatom_summary2 <- diatom_summary |>
+pivot_longer(
+cols = everything(),
+names_pattern = "(.+)_(mean|sd)$",
+names_to = c("taxon", "statistic"),
+values_to = "value"
+) |>
+pivot_wider(names_from = statistic, values_from = value) |>
+arrange(desc(mean))
+
+diatom_summary2
+```
+
+## Time series: relative abundance trajectories
+
+I visualize each taxon’s relative abundance through time.
+
+```{r}
+ts_plot <- diatoms3 |>
+pivot_longer(
+cols = A_curv:StephanSpp,
+names_to = "taxon",
+values_to = "rel_abund"
+) |>
+ggplot(aes(x = Age, y = rel_abund)) +
+geom_line(linewidth = 0.5) +
+facet_wrap(~ taxon, scales = "free_y") +
+labs(
+x = "Age (kyr BP; more negative = older)",
+y = "Relative abundance",
+title = "Diatom relative abundances through time"
+) +
+theme_bw() +
+theme(strip.background = element_blank())
+
+ts_plot
+```
+
+## Climate context: SST and key intervals
+
+I use SST reconstructions to contextualize biological change across two well-known intervals:
+
+* Late Glacial Interstadial: 14.7 to 12.9 kyr BP
+* Younger Dryas: 12.9 to 11.7 kyr BP
+
+```{r}
+seatemps <- read_csv("data/barron-sst.csv") |>
+mutate(Age = -1 * Age)
+
+sst_plot <- seatemps |>
+ggplot(aes(x = Age, y = SST)) +
+geom_line(linewidth = 0.6) +
+annotate(
+"rect",
+xmin = -14.7, xmax = -12.9,
+ymin = -Inf, ymax = Inf,
+alpha = 0.2
+) +
+annotate(
+"rect",
+xmin = -12.9, xmax = -11.7,
+ymin = -Inf, ymax = Inf,
+alpha = 0.2
+) +
+labs(
+x = "Age (kyr BP; more negative = older)",
+y = "Sea surface temperature (deg C)",
+title = "SST reconstruction with highlighted climate intervals"
+) +
+theme_bw()
+
+sst_plot
+```
+
+## Epoch comparison: before vs after 11.7 kyr BP
+
+I split samples into two epochs:
+
+* Before or equal to 11.7 kyr BP (older; late Pleistocene / transition)
+* After 11.7 kyr BP (younger; Holocene)
+
+Then I compare the distribution of Azpeitia nodulifer relative abundance.
+
+```{r}
+diatoms4 <- diatoms3 |>
+mutate(
+epoch = if_else(
+Age <= -11.7,
+"Before 11.7 kyr BP",
+"After 11.7 kyr BP"
+)
+)
+
+ridge_plot <- diatoms4 |>
+ggplot(aes(x = A_nodul, y = epoch, fill = epoch)) +
+geom_density_ridges(alpha = 0.7) +
+labs(
+x = "Relative abundance of Azpeitia nodulifer",
+y = "",
+title = "A. nodulifer abundance distribution by epoch"
+) +
+theme_bw() +
+theme(legend.position = "none")
+
+ridge_plot
+```
+
+## Linking diatoms to SST via LOESS interpolation
+
+SST is not observed at exactly the same ages as the diatom samples. I fit a LOESS curve and predict SST at diatom ages, then visualize SST vs abundance relationships.
+
+```{r}
+loess_fit <- loess(SST ~ Age, data = seatemps, span = 0.1)
+
+diatoms3 <- diatoms3 |>
+mutate(sst_pred = predict(loess_fit, newdata = Age))
+
+hex1 <- diatoms3 |>
+ggplot(aes(x = sst_pred, y = A_nodul)) +
+geom_hex() +
+labs(
+x = "Predicted SST (deg C)",
+y = "Relative abundance of A. nodulifer",
+title = "A. nodulifer vs predicted SST"
+) +
+theme_bw()
+
+hex2 <- diatoms3 |>
+ggplot(aes(x = sst_pred, y = A_octon)) +
+geom_hex() +
+labs(
+x = "Predicted SST (deg C)",
+y = "Relative abundance of A. octonarius",
+title = "A. octonarius vs predicted SST"
+) +
+theme_bw()
+
+hex1 + hex2
+```
+
+## Community-level structure
+
+### Correlation structure across taxa
+
+```{r}
+corr_mx <- diatoms3 |>
+select(A_curv:StephanSpp) |>
+cor(use = "pairwise.complete.obs")
+
+base_cols <- brewer.pal(11, "RdBu")
+plot_cols <- lighten(base_cols, amount = 0.1)
+
+corrplot(
+corr_mx,
+method = "circle",
+type   = "full",
+diag   = FALSE,
+col    = plot_cols,
+tl.col = "black"
+)
+```
+
+### Standardize taxa for multivariate models
+
+```{r}
+diatoms5 <- diatoms4 |>
+mutate(
+across(A_curv:StephanSpp, ~ as.numeric(scale(.x))),
+pleistocene = if_else(epoch == "Before 11.7 kyr BP", 1L, 0L)
+)
+
+scale_check <- diatoms5 |>
+summarize(
+across(
+A_curv:StephanSpp,
+list(
+mean = ~ mean(.x, na.rm = TRUE),
+sd   = ~ sd(.x,   na.rm = TRUE)
+)
+)
+)
+
+scale_check
+```
+
+Interpretation note: means are extremely close to 0 and SDs extremely close to 1. Tiny deviations are expected from floating-point arithmetic.
+
+## Logistic regression: supervised separation of epochs
+
+I fit a logistic regression where the response is epoch membership and predictors are standardized taxa.
+
+```{r}
+diatoms_glm <- diatoms5 |>
+select(pleistocene, A_curv:StephanSpp)
+
+logistic_result <- glm(
+pleistocene ~ .,
+data = diatoms_glm,
+family = binomial
+)
+
+summary(logistic_result)
+```
+
+```{r}
+lo_fit <- fitted(logistic_result)
+
+tibble(
+  fitted_min = min(lo_fit),
+  fitted_q25 = quantile(lo_fit, 0.25),
+  fitted_med = median(lo_fit),
+  fitted_q75 = quantile(lo_fit, 0.75),
+  fitted_max = max(lo_fit)
+)
+
+pred_class <- as.integer(lo_fit >= 0.5)
+
+confusion <- table(
+  truth = diatoms_glm$pleistocene,
+  pred  = pred_class
+)
+
+confusion
+mean(pred_class == diatoms_glm$pleistocene)
+```
+
+### Extract the normalized regression direction
+
+```{r}
+reg_direction <- coef(logistic_result)[-1]
+reg_direction <- reg_direction / sqrt(sum(reg_direction^2))
+
+length(reg_direction)
+reg_direction
+
+rop_epoch_plot <- diatoms4 |>
+  ggplot(aes(x = epoch, y = Rop_tess)) +
+  geom_boxplot(outlier.alpha = 0.2) +
+  geom_jitter(width = 0.15, alpha = 0.25) +
+  labs(
+    x = "",
+    y = "Relative abundance of Rop_tess",
+    title = "Rop_tess differs strongly by epoch (key driver of logistic separation)"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none")
+
+rop_epoch_plot
+```
+
+## PCA: unsupervised community variation
+
+I run PCA on standardized taxa (already scaled, so I do not re-center or re-scale inside prcomp).
+
+```{r}
+diatoms_pca <- diatoms5 |>
+select(A_curv:StephanSpp)
+
+pca_result <- prcomp(diatoms_pca, center = FALSE, scale. = FALSE)
+
+pc1_direction <- pca_result$rotation[, 1]
+pc2_direction <- pca_result$rotation[, 2]
+
+sqrt(sum(pc1_direction^2))
+sqrt(sum(pc2_direction^2))
+
+pc1_direction
+```
+
+## Compare PCA and logistic directions
+
+I compare absolute loadings from:
+
+* logistic regression direction (epoch-separating)
+* PC1 direction (dominant overall variance)
+
+```{r}
+reg_n_pc1 <- tibble(
+taxon    = names(reg_direction),
+logistic = abs(reg_direction),
+pc1      = abs(pc1_direction)
+) |>
+pivot_longer(
+cols = logistic:pc1,
+names_to = "direction",
+values_to = "loadings"
+)
+
+reg_n_pc1
+```
+
+### Dumbbell-style plot
+
+```{r}
+dumbbell_plot <- reg_n_pc1 |>
+ggplot(aes(x = loadings, y = taxon, shape = direction)) +
+geom_line(aes(group = taxon), linewidth = 1.2) +
+geom_point(size = 2.8) +
+labs(
+x = "Absolute loading magnitude",
+y = "",
+title = "Taxon importance: epoch-separating direction vs overall-variance direction"
+) +
+theme_minimal()
+
+dumbbell_plot
+```
+
+## Project samples onto both directions
+
+```{r}
+diatoms5_matrix <- diatoms5 |>
+select(A_curv:StephanSpp) |>
+as.matrix()
+
+pc1_score <- as.vector(diatoms5_matrix %*% pc1_direction)
+logistic_score <- as.vector(diatoms5_matrix %*% reg_direction)
+
+score_tables <- tibble(
+ID = 1:nrow(diatoms5),
+pc1_score = pc1_score,
+logistic_score = logistic_score,
+pleistocene = diatoms5$pleistocene
+)
+
+score_tables |>
+summarize(
+var_pc1 = var(pc1_score),
+var_logistic = var(logistic_score)
+)
+```
+PC1 should typically have larger variance than a random direction because it is defined to maximize variance among unit-length directions.
+
+### PC1 vs PC2 scatter (redundant coding)
+
+```{r}
+pc_scores <- as_tibble(pca_result$x[, 1:2])
+
+score_tables <- score_tables |>
+mutate(
+PC1 = pc_scores$PC1,
+PC2 = pc_scores$PC2
+)
+
+pc_scatter <- score_tables |>
+ggplot(aes(
+x = PC1, y = PC2,
+color = factor(pleistocene),
+shape = factor(pleistocene)
+)) +
+geom_point(size = 2) +
+labs(
+color = "Pleistocene epoch indicator",
+shape = "Pleistocene epoch indicator",
+title = "PCA space: PC1 vs PC2"
+) +
+theme_minimal()
+
+pc_scatter
+```
+
+### PC1 vs logistic score scatter
+
+```{r}
+pc1_log_scatter <- score_tables |>
+ggplot(aes(
+x = pc1_score, y = logistic_score,
+color = factor(pleistocene),
+shape = factor(pleistocene)
+)) +
+geom_point(size = 2) +
+labs(
+color = "Pleistocene epoch indicator",
+shape = "Pleistocene epoch indicator",
+x = "PC1 projection score",
+y = "Logistic direction projection score",
+title = "Unsupervised variation vs supervised epoch separation"
+) +
+theme_minimal()
+
+pc1_log_scatter
+```
+## Results and discussion
+
+### What changed through time?
+
+Across the time series plots, several taxa show pronounced shifts in relative abundance through the record. Converting counts to relative abundance was essential because Num.counted varies across samples, so raw counts are not directly comparable.
+
+### Epoch-level differences (before vs after 11.7 kyr BP)
+
+The ridgeline plot suggests Azpeitia nodulifer tends to have higher and more variable relative abundance in the older portion of the record (before 11.7 kyr BP), with the distribution shifting toward lower values after 11.7 kyr BP. This pattern is consistent with a community-level response to changing ocean conditions at the Pleistocene-Holocene transition.
+
+### Relationship with SST
+
+Using LOESS to predict SST at diatom sample ages enables direct comparison between temperature and relative abundance. The hexbin plots provide a density-aware view of how abundances occupy different temperature ranges. In practice, this helps distinguish whether a taxon is:
+
+* broadly present across temperatures (weak relationship), or
+* concentrated in certain temperature bands (stronger relationship)
+
+### Community structure (PCA vs logistic regression)
+
+PCA summarizes overall community variance without using epoch labels. Logistic regression explicitly seeks a direction that separates epochs. Comparing their loadings helps answer:
+
+* Are the taxa that drive overall variability the same taxa that best distinguish epochs?
+
+If the same taxa have large loadings in both, then the dominant community axis aligns with the epoch shift. If not, then the epoch difference is a secondary pattern relative to other sources of variability. In this dataset, the logistic regression achieves near-perfect epoch separation (residual deviance essentially 0), so I interpret the logistic coefficient vector as a supervised discriminant direction rather than relying on its p-values for inference. The normalized direction is also dominated by Rop_tess, indicating this taxon is a key contributor to epoch separation.
+
+### Why separation looks different across plots
+
+In PC1-PC2 space, separation may be oblique and imperfect because PCs are not optimized for class separation. In PC1 vs logistic-score space, separation is typically cleaner along the logistic axis because that direction is trained to discriminate the binary epoch label.
+
+## Limitations and next steps
+
+Limitations:
+
+* Epoch labeling is a hard threshold at 11.7 kyr BP; transitions can be gradual.
+* LOESS-based SST interpolation depends on the chosen span.
+* Relative abundances are compositional-like measurements; more advanced methods (e.g., centered log-ratio transforms) could be explored.
+
+Next steps:
+
+* Sensitivity analysis for LOESS span and epoch boundary choice.
+* Add confidence intervals for smoothed trends and effect sizes.
+* Explore alternative multivariate methods (e.g., LDA, PLS-DA, compositional PCA).
